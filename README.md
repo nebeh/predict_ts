@@ -5,3 +5,4 @@
 2. Базовое предсказание: lstm
 3. Chronos
 4. Temporal Fusion Transformer
+5. other
