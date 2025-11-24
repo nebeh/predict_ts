@@ -27,41 +27,84 @@ class ChronosModel(BaseForecastModel):
     def fit(self, data: np.ndarray) -> None:
         """Chronos не требует обучения, использует предобученную модель"""
         try:
+            from pathlib import Path
+            
+            # Сначала проверяем локальный кэш HuggingFace
+            def find_local_cache(model_id: str) -> str:
+                """Ищет модель в локальном кэше HuggingFace"""
+                # Преобразуем model_id в путь кэша (amazon/chronos-t5-tiny -> models--amazon--chronos-t5-tiny)
+                cache_dir = model_id.replace("/", "--")
+                cache_path = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{cache_dir}"
+                
+                if cache_path.exists():
+                    # Ищем snapshots
+                    snapshots = list(cache_path.glob("snapshots/*"))
+                    if snapshots:
+                        # Берем последний snapshot (самый свежий)
+                        latest_snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+                        return str(latest_snapshot)
+                return None
+            
             # Правильные имена моделей Chronos на HuggingFace
             # Доступные модели: amazon/chronos-t5-tiny, amazon/chronos-bolt-tiny, amazon/chronos-2 и др.
             model_variants = []
             
             # Если указан "chronos-tiny", пробуем правильные варианты
-            if self.model_name == "chronos-tiny":
+            if self.model_name == "chronos-tiny" or "chronos-tiny" in self.model_name.lower():
                 model_variants = [
-                    "amazon/chronos-t5-tiny",  # Правильное имя
+                    "amazon/chronos-t5-tiny",  # Правильное имя (самое распространенное)
                     "amazon/chronos-bolt-tiny",
                     "amazon/chronos-tiny",  # На случай если есть
                 ]
+            elif self.model_name.startswith("amazon/"):
+                # Если уже указан полный путь, используем его
+                model_variants = [self.model_name]
             else:
                 # Для других имен пробуем стандартные варианты
                 model_variants = [
+                    f"amazon/chronos-t5-{self.model_name}" if not self.model_name.startswith("chronos-") else f"amazon/{self.model_name}",
                     f"amazon/{self.model_name}",
                     self.model_name,
                 ]
             
             self.pipeline = None
             last_error = None
-            for model_path in model_variants:
-                try:
-                    # Пробуем загрузить модель
-                    self.pipeline = ChronosPipeline.from_pretrained(model_path, device_map="cpu")
-                    print(f"Chronos успешно загружен: {model_path}")
-                    break
-                except Exception as e:
-                    last_error = e
-                    continue
+            
+            # Сначала пробуем загрузить из локального кэша
+            for model_id in model_variants:
+                local_path = find_local_cache(model_id)
+                if local_path:
+                    try:
+                        # Используем локальный путь напрямую
+                        self.pipeline = ChronosPipeline.from_pretrained(local_path, device_map="cpu")
+                        print(f"✓ Chronos успешно загружен из локального кэша: {model_id}")
+                        break
+                    except Exception as e:
+                        # Если локальный путь не работает, сохраняем ошибку и пробуем следующий вариант
+                        last_error = e
+                        continue
+            
+            # Если локальный кэш не сработал, пробуем загрузить по имени модели
+            # (HuggingFace автоматически проверит локальный кэш)
+            if self.pipeline is None:
+                for model_path in model_variants:
+                    try:
+                        self.pipeline = ChronosPipeline.from_pretrained(model_path, device_map="cpu")
+                        print(f"✓ Chronos успешно загружен: {model_path}")
+                        break
+                    except Exception as e:
+                        last_error = e
+                        continue
             
             if self.pipeline is None:
-                raise Exception(f"Не удалось загрузить ни один вариант модели. Последняя ошибка: {last_error}")
+                error_msg = str(last_error) if last_error else "Неизвестная ошибка"
+                # Показываем, какие варианты пробовались
+                tried_variants = ", ".join(model_variants)
+                raise Exception(f"Не удалось загрузить ни один вариант модели из [{tried_variants}]. Последняя ошибка: {error_msg}")
                 
         except Exception as e:
-            print(f"Не удалось загрузить Chronos: {e}. Будет использован упрощенный метод.")
+            print(f"⚠ Не удалось загрузить Chronos: {e}")
+            print("  Будет использован упрощенный метод.")
             self.pipeline = None
         self.data = data.copy()
         self.last_value = data[-1]

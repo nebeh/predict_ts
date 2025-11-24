@@ -36,8 +36,23 @@ pip install timesfm
 - pandas==2.1.4
 - scikit-learn==1.5.1
 
-### 3. PatchTST, iTransformer, TFT
-Эти модели требуют PyTorch:
+### 3. PatchTST
+PatchTST использует предобученные веса из HuggingFace через библиотеку `transformers`:
+```bash
+pip install transformers
+```
+
+Также требуется PyTorch:
+```bash
+micromamba install -y pytorch -c pytorch
+# или
+pip install torch
+```
+
+**Примечание**: PatchTST автоматически загружает предобученные веса из `ibm-research/patchtst-etth1-pretrain` при первом использовании.
+
+### 4. iTransformer, TFT
+Эти модели требуют PyTorch (в текущей реализации используются упрощенные методы):
 ```bash
 micromamba install -y pytorch -c pytorch
 # или
