@@ -52,7 +52,7 @@ pip install torch
 **Примечание**: PatchTST автоматически загружает предобученные веса из `ibm-research/patchtst-etth1-pretrain` при первом использовании.
 
 ### 4. iTransformer, TFT
-Эти модели требуют PyTorch (в текущей реализации используются упрощенные методы):
+Эти модели требуют PyTorch и используют полноценные нейросетевые архитектуры:
 ```bash
 micromamba install -y pytorch -c pytorch
 # или

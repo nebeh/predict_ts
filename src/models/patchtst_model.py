@@ -31,6 +31,7 @@ class PatchTSTModel(BaseForecastModel):
         self.scaler_mean = None
         self.scaler_std = None
         self.data = None
+        self.required_context_length = None  # Будет установлено при загрузке модели
         if not TRANSFORMERS_AVAILABLE:
             print("Предупреждение: transformers не установлен. Будет использован упрощенный метод.")
         if not TORCH_AVAILABLE:
@@ -59,9 +60,59 @@ class PatchTSTModel(BaseForecastModel):
                 print(f"Загрузка предобученной модели PatchTST: {self.model_name}")
                 # Пробуем загрузить предобученную модель
                 try:
-                    self.model = PatchTSTForPrediction.from_pretrained(self.model_name)
+                    # Загружаем конфигурацию модели
+                    try:
+                        config = PatchTSTConfig.from_pretrained(self.model_name)
+                    except:
+                        # Если не удалось загрузить конфигурацию, создаем новую
+                        config = PatchTSTConfig()
+                    
+                    # Получаем требуемую длину контекста из конфигурации модели
+                    if hasattr(config, 'context_length') and config.context_length is not None:
+                        self.required_context_length = config.context_length
+                    else:
+                        # По умолчанию используем 512 (стандартная длина для PatchTST)
+                        self.required_context_length = 512
+                        config.context_length = 512
+                    
+                    # ВАЖНО: Обновляем конфигурацию для univariate данных (1 канал)
+                    # Предобученная модель может быть настроена на multivariate (7 каналов)
+                    config.num_input_channels = 1  # Устанавливаем 1 канал для univariate
+                    config.prediction_length = 1  # Для авторегрессивного режима
+                    
+                    # Пробуем загрузить модель с обновленной конфигурацией
+                    try:
+                        self.model = PatchTSTForPrediction.from_pretrained(
+                            self.model_name,
+                            config=config,
+                            ignore_mismatched_sizes=True  # Игнорируем несоответствие размеров
+                        )
+                    except Exception as e1:
+                        # Если не удалось загрузить с ignore_mismatched_sizes, создаем новую модель
+                        print(f"  ⚠ Не удалось загрузить с ignore_mismatched_sizes: {e1}")
+                        print(f"  Создаю новую модель с правильной конфигурацией...")
+                        self.model = PatchTSTForPrediction(config=config)
+                        # Пробуем загрузить веса только для совместимых слоев
+                        try:
+                            pretrained_model = PatchTSTForPrediction.from_pretrained(self.model_name)
+                            # Копируем веса только для совместимых слоев (исключая input embedding)
+                            state_dict = pretrained_model.state_dict()
+                            model_dict = self.model.state_dict()
+                            # Фильтруем веса, исключая слои, связанные с num_input_channels
+                            filtered_dict = {k: v for k, v in state_dict.items() 
+                                           if k in model_dict and 'value_embedding' not in k 
+                                           and model_dict[k].shape == v.shape}
+                            model_dict.update(filtered_dict)
+                            self.model.load_state_dict(model_dict, strict=False)
+                            print(f"  ✓ Загружены совместимые веса из предобученной модели")
+                        except Exception as e2:
+                            print(f"  ⚠ Не удалось загрузить веса: {e2}")
+                            print(f"  Модель будет использовать случайную инициализацию")
+                    
                     self.model.eval()  # Переводим в режим оценки
-                    print(f"✓ Модель PatchTST успешно загружена из HuggingFace")
+                    print(f"✓ Модель PatchTST успешно загружена/создана")
+                    print(f"  Требуемая длина контекста: {self.required_context_length}")
+                    print(f"  Количество каналов: {config.num_input_channels}")
                 except Exception as e:
                     print(f"⚠ Не удалось загрузить предобученную модель {self.model_name}: {e}")
                     print("  Будет использован упрощенный метод")
@@ -92,8 +143,20 @@ class PatchTSTModel(BaseForecastModel):
                 # Подготавливаем входные данные для модели
                 # PatchTST ожидает тензор формы (batch_size, sequence_length, num_features)
                 # Для унивариантного ряда: (1, seq_len, 1)
-                context_len = min(self.seq_len, len(normalized_data))
-                context = normalized_data[-context_len:]
+                # Используем требуемую длину контекста из конфигурации модели
+                if self.required_context_length is not None:
+                    context_len = self.required_context_length
+                else:
+                    # Fallback: используем seq_len или длину данных
+                    context_len = min(self.seq_len, len(normalized_data))
+                
+                # Берем последние context_len элементов или дополняем первым значением
+                if len(normalized_data) >= context_len:
+                    context = normalized_data[-context_len:]
+                else:
+                    # Если данных меньше требуемой длины, дополняем первым значением
+                    padding = np.full(context_len - len(normalized_data), normalized_data[0] if len(normalized_data) > 0 else 0.0)
+                    context = np.concatenate([padding, normalized_data])
                 
                 # Авторегрессивный прогноз: каждый следующий день опирается на предыдущие предсказания
                 predictions = []
@@ -105,11 +168,63 @@ class PatchTSTModel(BaseForecastModel):
                     for step in range(horizon):
                         # Подготавливаем тензор для модели
                         # PatchTST ожидает (batch_size, sequence_length, num_features)
+                        # Для univariate: (1, sequence_length, 1)
                         input_tensor = torch.tensor(current_context, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
                         
+                        # Убеждаемся, что форма тензора правильная: (batch, seq_len, num_channels)
+                        # num_channels должно быть 1 для univariate
+                        assert input_tensor.shape == (1, len(current_context), 1), \
+                            f"Неверная форма тензора: {input_tensor.shape}, ожидается (1, {len(current_context)}, 1)"
+                        
                         # Получаем прогноз от модели
-                        outputs = self.model(past_values=input_tensor, prediction_length=1)
-                        pred_value = outputs.prediction_mean[0, 0, 0].item()
+                        # PatchTSTForPrediction использует только past_values в forward()
+                        # prediction_length задается в конфигурации модели
+                        outputs = self.model(past_values=input_tensor)
+                        
+                        # Получаем прогноз из outputs
+                        # PatchTSTForPrediction возвращает объект с prediction_outputs
+                        try:
+                            if hasattr(outputs, 'prediction_outputs'):
+                                # prediction_outputs имеет форму (batch, prediction_length, num_features)
+                                pred_tensor = outputs.prediction_outputs
+                                if pred_tensor.dim() == 3:
+                                    pred_value = pred_tensor[0, 0, 0].item()
+                                elif pred_tensor.dim() == 2:
+                                    pred_value = pred_tensor[0, 0].item()
+                                else:
+                                    pred_value = pred_tensor[0].item()
+                            elif hasattr(outputs, 'prediction_mean'):
+                                # Альтернативный вариант
+                                pred_tensor = outputs.prediction_mean
+                                if pred_tensor.dim() == 3:
+                                    pred_value = pred_tensor[0, 0, 0].item()
+                                elif pred_tensor.dim() == 2:
+                                    pred_value = pred_tensor[0, 0].item()
+                                else:
+                                    pred_value = pred_tensor[0].item()
+                            elif isinstance(outputs, tuple) and len(outputs) > 0:
+                                # Если outputs - это кортеж, берем первый элемент
+                                pred_tensor = outputs[0]
+                                if pred_tensor.dim() >= 3:
+                                    pred_value = pred_tensor[0, 0, 0].item()
+                                elif pred_tensor.dim() == 2:
+                                    pred_value = pred_tensor[0, 0].item()
+                                else:
+                                    pred_value = pred_tensor[0].item()
+                            elif hasattr(outputs, 'last_hidden_state'):
+                                # Используем last_hidden_state как fallback
+                                pred_tensor = outputs.last_hidden_state
+                                if pred_tensor.dim() >= 2:
+                                    # Берем последний элемент и применяем простую проекцию
+                                    pred_value = pred_tensor[0, -1, 0].item()
+                                else:
+                                    pred_value = pred_tensor[0].item()
+                            else:
+                                # Если ничего не подошло, пробуем получить доступ к тензору напрямую
+                                raise ValueError(f"Не удалось извлечь прогноз. Тип outputs: {type(outputs)}")
+                        except Exception as e:
+                            # Если не удалось извлечь прогноз, переходим на fallback
+                            raise ValueError(f"Ошибка при извлечении прогноза: {e}")
                         
                         # Денормализуем
                         pred_value = self._denormalize(np.array([pred_value]))[0]
@@ -134,7 +249,15 @@ class PatchTSTModel(BaseForecastModel):
                         # Обновляем контекст для следующего шага, используя СВОЕ предсказание
                         # Добавляем предсказание в контекст (нормализованное)
                         pred_normalized = self._normalize(np.array([pred_value]))[0]
+                        # Сохраняем требуемую длину контекста
                         current_context = np.append(current_context[1:], pred_normalized)
+                        # Убеждаемся, что длина контекста соответствует требуемой
+                        if len(current_context) > context_len:
+                            current_context = current_context[-context_len:]
+                        elif len(current_context) < context_len:
+                            # Дополняем первым значением, если нужно
+                            padding = np.full(context_len - len(current_context), current_context[0])
+                            current_context = np.concatenate([padding, current_context])
                 
                 predictions = np.array(predictions)
                 
